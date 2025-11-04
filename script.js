@@ -13,6 +13,8 @@ const state = {
   lastStatus: 'Подключите кошелёк',
   lastTone: 'info',
   lastStatusTime: null,
+  extraNativeBalance: null,
+  lastConnectedChainId: null,
 };
 
 const els = {
@@ -69,9 +71,16 @@ const tokenFormat = new Intl.NumberFormat('ru-RU', {
   maximumFractionDigits: 4,
 });
 
+let tonConnect = null;
+let evmProvider = null;
+let evmProviderType = null;
+let evmAccount = null;
+let manualDisconnect = false;
+
 function init() {
   els.year.textContent = new Date().getFullYear();
   setupEvents();
+  initTonConnect();
   ensurePairIntegrity();
   updateRateDisplays();
   updateBalances();
@@ -99,14 +108,14 @@ function setupEvents() {
   });
 
   els.walletOptions.forEach((option) => {
-    option.addEventListener('click', () => {
-      connectWallet(option.dataset.wallet);
+    option.addEventListener('click', async () => {
       toggleWalletModal(false);
+      await connectWallet(option.dataset.wallet);
     });
   });
 
-  els.disconnectBtn.addEventListener('click', () => {
-    disconnectWallet();
+  els.disconnectBtn.addEventListener('click', async () => {
+    await disconnectWallet();
   });
 
   els.fromAmount.addEventListener('input', updateQuotePreview);
@@ -143,41 +152,407 @@ function toggleWalletModal(show) {
   els.walletModal.classList.toggle('hidden', !show);
 }
 
-function connectWallet(type) {
+async function initTonConnect() {
+  if (tonConnect || !window.TON_CONNECT) {
+    return;
+  }
+  try {
+    const manifestUrl = resolveManifestUrl();
+    tonConnect = new window.TON_CONNECT.TonConnect({ manifestUrl });
+    tonConnect.onStatusChange(handleTonStatusChange);
+    await tonConnect.restoreConnection();
+  } catch (error) {
+    console.error('TonConnect init failed', error);
+  }
+}
+
+function resolveManifestUrl() {
+  try {
+    const baseHref = window.location.href || `${window.location.origin}/`;
+    const url = new URL('tonconnect-manifest.json', baseHref);
+    return url.toString();
+  } catch (error) {
+    console.error('resolveManifestUrl', error);
+  }
+  return 'https://metaswap.example/tonconnect-manifest.json';
+}
+
+async function connectTonKeeper() {
+  if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
+    throw new Error('TonKeeper требует запуска сайта по HTTPS или через публичный домен');
+  }
+  if (!tonConnect) {
+    throw new Error('TonConnect SDK не инициализирован');
+  }
+  if (state.connected && state.walletType === 'TonKeeper') {
+    showToast('TonKeeper уже подключён', 'info');
+    return;
+  }
+  setStatus('Ожидаем подтверждение в TonKeeper…', 'info');
+  showToast('Подтвердите запрос в TonKeeper', 'info');
+  const wallets = await tonConnect.getWallets();
+  const tonkeeper = wallets.find((wallet) => /tonkeeper/i.test(wallet.name));
+  const connectionSource = tonkeeper
+    ? { universalLink: tonkeeper.universalLink, bridgeUrl: tonkeeper.bridgeUrl }
+    : { universalLink: 'https://app.tonkeeper.com/ton-connect', bridgeUrl: 'https://bridge.tonapi.io/bridge' };
+  await tonConnect.connect(connectionSource);
+}
+
+async function handleTonStatusChange(walletInfo) {
+  if (!walletInfo) {
+    if (state.walletType === 'TonKeeper' || manualDisconnect) {
+      const notify = manualDisconnect || state.connected;
+      applyDisconnected({
+        notify,
+        message: 'TonKeeper отключён',
+        tone: manualDisconnect ? 'success' : 'info',
+        toast: manualDisconnect ? 'Сессия завершена' : 'TonKeeper отключён',
+      });
+      manualDisconnect = false;
+    }
+    return;
+  }
+  const address = walletInfo.account?.address || walletInfo.account?.address?.toString() || '';
+  const tonBalance = await fetchTonBalance(address);
+  if (tonBalance === null) {
+    showToast('Не удалось получить баланс TON', 'info');
+  }
+  applyConnection({
+    type: 'TonKeeper',
+    address,
+    balances: { TON: tonBalance ?? 0, USDT: 0 },
+    status: `TonKeeper подключён. Адрес ${shortAddress(address)}`,
+    tone: 'success',
+    toast: 'TonKeeper подключён',
+  });
+}
+
+async function fetchTonBalance(address) {
+  if (!address) {
+    return 0;
+  }
+  try {
+    const response = await fetch(`https://tonapi.io/v2/accounts/${address}`);
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    const balanceCandidate =
+      payload.balance ?? payload.account?.balance ?? payload.result?.balance ?? null;
+    if (balanceCandidate === null || balanceCandidate === undefined) {
+      return null;
+    }
+    const bigintValue = typeof balanceCandidate === 'string' ? BigInt(balanceCandidate) : BigInt(balanceCandidate);
+    return Number(bigintValue) / 1_000_000_000;
+  } catch (error) {
+    console.error('fetchTonBalance', error);
+    return null;
+  }
+}
+
+async function connectEvmWallet(type) {
+  const provider = getEvmProvider(type);
+  if (!provider) {
+    throw new Error(`${type} недоступен в этом браузере. Установите расширение или откройте dApp внутри кошелька.`);
+  }
+  if (state.connected && state.walletType === type && evmAccount) {
+    showToast(`${type} уже подключён`, 'info');
+    return;
+  }
+  evmProvider = provider;
+  evmProviderType = type;
+  bindEvmEvents(provider);
+  const accounts = await provider.request({ method: 'eth_requestAccounts' });
+  if (!accounts || accounts.length === 0) {
+    throw new Error('Кошелёк не вернул адреса аккаунтов');
+  }
+  evmAccount = accounts[0];
+  const chainId = await provider.request({ method: 'eth_chainId' });
+  state.lastConnectedChainId = chainId;
+  const contractMeta = getUsdtContract(chainId);
+  const [nativeBalance, usdtBalance] = await Promise.all([
+    fetchEvmNativeBalance(provider, evmAccount),
+    fetchUsdtBalance(provider, evmAccount, chainId),
+  ]);
+  state.extraNativeBalance = nativeBalance;
+  applyConnection({
+    type,
+    address: evmAccount,
+    balances: { TON: 0, USDT: usdtBalance ?? 0 },
+    status: `${type} подключён. Адрес ${shortAddress(evmAccount)}`,
+    tone: 'success',
+    toast: `${type} подключён`,
+  });
+  if (!contractMeta) {
+    showToast('Добавьте адрес контракта USDT для текущей сети', 'info');
+  }
+}
+
+function getEvmProvider(type) {
+  const { ethereum } = window;
+  if (!ethereum) {
+    return null;
+  }
+  if (ethereum.providers && Array.isArray(ethereum.providers)) {
+    const match = ethereum.providers.find((provider) => {
+      if (type === 'MetaMask') {
+        return provider.isMetaMask;
+      }
+      if (type === 'Trust Wallet') {
+        return provider.isTrust || provider.isTrustWallet;
+      }
+      return false;
+    });
+    if (match) {
+      return match;
+    }
+  }
+  if (type === 'MetaMask' && ethereum.isMetaMask) {
+    return ethereum;
+  }
+  if (type === 'Trust Wallet' && (ethereum.isTrust || ethereum.isTrustWallet)) {
+    return ethereum;
+  }
+  return ethereum;
+}
+
+function bindEvmEvents(provider) {
+  unbindEvmEvents();
+  if (provider && provider.on) {
+    provider.on('accountsChanged', handleEvmAccountsChanged);
+    provider.on('disconnect', handleEvmDisconnect);
+  }
+}
+
+function unbindEvmEvents() {
+  if (evmProvider && evmProvider.removeListener) {
+    evmProvider.removeListener('accountsChanged', handleEvmAccountsChanged);
+    evmProvider.removeListener('disconnect', handleEvmDisconnect);
+  }
+}
+
+async function handleEvmAccountsChanged(accounts) {
+  if (!accounts || accounts.length === 0) {
+    evmAccount = null;
+    applyDisconnected({
+      notify: true,
+      message: `${evmProviderType || 'Кошелёк'} отключён`,
+      tone: 'info',
+      toast: `${evmProviderType || 'Кошелёк'} отключён`,
+    });
+    return;
+  }
+  evmAccount = accounts[0];
+  try {
+    const previousChain = state.lastConnectedChainId;
+    const chainId = await evmProvider.request({ method: 'eth_chainId' });
+    const contractMeta = getUsdtContract(chainId);
+    state.lastConnectedChainId = chainId;
+    const usdtBalance = await fetchUsdtBalance(evmProvider, evmAccount, chainId);
+    state.walletAddress = evmAccount;
+    state.walletBalances.TON = 0;
+    state.walletBalances.USDT = usdtBalance ?? 0;
+    state.lastStatus = `${evmProviderType || 'Кошелёк'} обновлён. Адрес ${shortAddress(evmAccount)}`;
+    state.lastTone = 'info';
+    state.lastStatusTime = new Date();
+    updateHeader();
+    updateBalances();
+    updateFormHints();
+    updateQuotePreview();
+    renderStatus();
+    showToast('Адрес кошелька обновлён', 'info');
+    if (!contractMeta && chainId !== previousChain) {
+      showToast('Добавьте адрес контракта USDT для текущей сети', 'info');
+    }
+  } catch (error) {
+    console.error('handleEvmAccountsChanged', error);
+  }
+}
+
+function handleEvmDisconnect() {
+  applyDisconnected({
+    notify: true,
+    message: `${evmProviderType || 'Кошелёк'} отключён`,
+    tone: 'info',
+    toast: `${evmProviderType || 'Кошелёк'} отключён`,
+  });
+  evmProviderType = null;
+  evmAccount = null;
+}
+
+async function fetchEvmNativeBalance(provider, address) {
+  try {
+    const balanceHex = await provider.request({ method: 'eth_getBalance', params: [address, 'latest'] });
+    return hexToDecimal(balanceHex, 18);
+  } catch (error) {
+    console.error('fetchEvmNativeBalance', error);
+    return null;
+  }
+}
+
+async function fetchUsdtBalance(provider, address, chainId) {
+  const contract = getUsdtContract(chainId);
+  if (!contract) {
+    return null;
+  }
+  try {
+    const data = buildBalanceOfData(address);
+    const balanceHex = await provider.request({
+      method: 'eth_call',
+      params: [
+        {
+          to: contract.address,
+          data,
+        },
+        'latest',
+      ],
+    });
+    return hexToDecimal(balanceHex, contract.decimals);
+  } catch (error) {
+    console.error('fetchUsdtBalance', error);
+    return null;
+  }
+}
+
+function getUsdtContract(chainId) {
+  const normalized = chainId ? chainId.toLowerCase() : '';
+  const map = {
+    '0x1': { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
+    '0x38': { address: '0x55d398326f99059fF775485246999027B3197955', decimals: 18 },
+    '0x89': { address: '0xC2132D05D31c914a87C6611C10748AEb04B58e8F', decimals: 6 },
+    '0xa4b1': { address: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', decimals: 6 },
+    '0xa86a': { address: '0x9702230A8Ea53601f5Cd2dc00fDbc13d4dF4A8c7', decimals: 6 },
+  };
+  return map[normalized] || null;
+}
+
+function buildBalanceOfData(address) {
+  const cleaned = address.replace(/^0x/, '').toLowerCase();
+  return `0x70a08231${cleaned.padStart(64, '0')}`;
+}
+
+function hexToDecimal(hexValue, decimals) {
+  if (!hexValue || hexValue === '0x') {
+    return 0;
+  }
+  try {
+    const value = BigInt(hexValue);
+    const base = BigInt(10) ** BigInt(decimals);
+    const whole = value / base;
+    const fraction = value % base;
+    return Number(whole) + Number(fraction) / Number(base);
+  } catch (error) {
+    console.error('hexToDecimal', error);
+    return 0;
+  }
+}
+
+function applyConnection({ type, address, balances, status, tone = 'success', toast }) {
   state.connected = true;
   state.walletType = type;
-  state.walletAddress = generateAddress();
+  state.walletAddress = address;
   state.walletBalances = {
-    TON: randomBetween(120, 420, 4),
-    USDT: randomBetween(850, 3200, 2),
+    TON: balances?.TON ?? 0,
+    USDT: balances?.USDT ?? 0,
   };
-  state.exchangeBalances = { TON: randomBetween(0, 35, 3), USDT: randomBetween(20, 240, 2) };
-  state.lastStatus = `${type} подключён. Адрес ${shortAddress(state.walletAddress)}`;
-  state.lastTone = 'success';
-  state.lastStatusTime = new Date();
-  showToast('Кошелёк подключён', 'success');
+  if (status) {
+    state.lastStatus = status;
+    state.lastTone = tone;
+    state.lastStatusTime = new Date();
+  }
   updateHeader();
   updateBalances();
   updateFormHints();
   updateQuotePreview();
   renderStatus();
+  if (toast !== false) {
+    const message = typeof toast === 'string' ? toast : 'Кошелёк подключён';
+    showToast(message, tone);
+  }
 }
 
-function disconnectWallet() {
+function applyDisconnected({ notify = true, message = 'Кошелёк отключён', tone = 'info', toast } = {}) {
+  if (state.walletType === 'Trust Wallet' || state.walletType === 'MetaMask' || evmProviderType) {
+    unbindEvmEvents();
+    evmProviderType = null;
+    evmAccount = null;
+  }
   state.connected = false;
   state.walletType = null;
   state.walletAddress = null;
   state.walletBalances = { TON: 0, USDT: 0 };
   state.exchangeBalances = { TON: 0, USDT: 0 };
-  state.lastStatus = 'Кошелёк отключён';
-  state.lastTone = 'info';
+  state.extraNativeBalance = null;
+  state.lastConnectedChainId = null;
+  state.lastStatus = message;
+  state.lastTone = tone;
   state.lastStatusTime = new Date();
-  showToast('Сессия завершена', 'success');
+  manualDisconnect = false;
   updateHeader();
   updateBalances();
   updateFormHints();
   updateQuotePreview();
   renderStatus();
+  if (notify) {
+    const toastMessage = typeof toast === 'string' ? toast : message;
+    showToast(toastMessage, tone);
+  }
+}
+
+async function connectWallet(type) {
+  try {
+    if (type === 'TonKeeper') {
+      await connectTonKeeper();
+      return;
+    }
+    if (type === 'Trust Wallet' || type === 'MetaMask') {
+      await connectEvmWallet(type);
+      return;
+    }
+    showToast('Этот кошелёк пока не поддерживается', 'error');
+  } catch (error) {
+    console.error('connectWallet', error);
+    let message =
+      error && typeof error.message === 'string'
+        ? error.message
+        : 'Не удалось подключить кошелёк';
+    if (error && typeof error.message === 'string' && /reject|cancel/i.test(error.message)) {
+      message = 'Подключение отменено пользователем';
+    }
+    if (typeof error?.code === 'number' && error.code === 300) {
+      message = 'Подключение отменено пользователем';
+    }
+    setStatus(message, 'error');
+    showToast(message, 'error');
+  }
+}
+
+async function disconnectWallet() {
+  if (!state.connected) {
+    return;
+  }
+  if (state.walletType === 'TonKeeper' && tonConnect) {
+    manualDisconnect = true;
+    try {
+      await tonConnect.disconnect();
+    } catch (error) {
+      console.error('TonConnect disconnect', error);
+      manualDisconnect = false;
+      applyDisconnected({
+        notify: true,
+        message: 'TonKeeper отключён',
+        tone: 'info',
+        toast: 'TonKeeper отключён',
+      });
+    }
+    return;
+  }
+  applyDisconnected({
+    notify: true,
+    message: 'Сессия завершена',
+    tone: 'success',
+    toast: 'Сессия завершена',
+  });
 }
 
 function updateHeader() {
@@ -384,16 +759,13 @@ function formatInteger(value) {
   return new Intl.NumberFormat('ru-RU').format(Math.round(value));
 }
 
-function generateAddress() {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let base = 'EQ';
-  for (let i = 0; i < 44; i += 1) {
-    base += alphabet[Math.floor(Math.random() * alphabet.length)];
-  }
-  return base;
-}
-
 function shortAddress(address) {
+  if (!address) {
+    return '';
+  }
+  if (address.length <= 10) {
+    return address;
+  }
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
 
