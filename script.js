@@ -1,3 +1,19 @@
+window.addEventListener('DOMContentLoaded', () => {
+  if (typeof TonConnect === 'undefined') {
+    console.error('❌ TonConnect SDK не найден. Проверь подключение скрипта.');
+    return;
+  }
+
+  // === основной код TonConnect ===
+  const tonConnect = new TonConnect({
+    manifestUrl: "https://ment345.github.io/metaswapOld/tonconnect-manifest.json"
+  });
+
+  console.log('✅ TonConnect SDK инициализирован');
+  
+  // дальше твой код подключения кошелька
+});
+
 const state = {
   connected: false,
   walletType: null,
