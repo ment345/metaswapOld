@@ -801,3 +801,42 @@ function showToast(message, tone = 'info') {
 }
 
 init();
+// === QR-подключение кошелька через TonConnect ===
+window.addEventListener("DOMContentLoaded", () => {
+  if (typeof TonConnect === "undefined") {
+    console.error("❌ TonConnect SDK не найден. Проверь подключение скрипта!");
+    return;
+  }
+
+  const connector = new TonConnect({
+    manifestUrl: "https://ment345.github.io/metaswapOld/tonconnect-manifest.json"
+  });
+
+  const connectBtn = document.getElementById("openWalletModal");
+  if (!connectBtn) {
+    console.warn("⚠️ Кнопка 'Подключить кошелёк' не найдена!");
+    return;
+  }
+
+  connectBtn.addEventListener("click", async () => {
+    try {
+      // Если сайт открыт на телефоне — TonKeeper откроется сразу
+      // Если на ПК — появится QR-код для сканирования
+      await connector.connect();
+      console.log("✅ Кошелёк подключён:", connector.wallet);
+      document.getElementById("swapStatusText").textContent = "✅ Кошелёк подключён!";
+    } catch (e) {
+      console.error("❌ Ошибка подключения:", e);
+      document.getElementById("swapStatusText").textContent = "❌ Ошибка подключения";
+    }
+  });
+
+  connector.onStatusChange((wallet) => {
+    if (wallet) {
+      document.getElementById("swapStatusText").textContent =
+        `✅ Подключён: ${wallet.account.address.slice(0, 6)}...${wallet.account.address.slice(-4)}`;
+    } else {
+      document.getElementById("swapStatusText").textContent = "Кошелёк отключён";
+    }
+  });
+});
